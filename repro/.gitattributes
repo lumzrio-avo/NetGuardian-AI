@@ -1,0 +1,13 @@
+# 统一换行符：仓库内文本文件一律使用 LF
+# （.sh 若变成 CRLF，在 WSL/Linux 下会报 `$'\r': command not found`）
+* text=auto eol=lf
+
+# 明确声明为二进制，禁止换行转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.npy  binary
+*.npz  binary
+*.zip  binary
+*.gz   binary
