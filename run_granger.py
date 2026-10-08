@@ -26,6 +26,7 @@ Date:   2026-07-22
 import networkx as nx
 import argparse
 import glob
+import json
 import os
 import sys
 import time
@@ -143,6 +144,10 @@ def parse_args():
         "--resume", action="store_true",
         help="断点续跑：跳过输出目录中已存在的案例",
     )
+    parser.add_argument(
+        "--shard", type=str, default=None,
+        help="分片并行：格式 I/N（如 2/6），只处理第 I 份。各分片必须用不同的 --output 目录",
+    )
     return parser.parse_args()
 
 
@@ -179,6 +184,15 @@ def load_and_preprocess(
 
     if verbose:
         print(f"  [LOAD] {data_path}")
+
+    # === Step 1.5: 官方仅在 mm-tt / torai-TT 上只保留 ts- 前缀列 ===
+    # 严格对齐 main.py:198-201 的原始条件（此前误写成「ts- 列占比 > 30%」的启发式判断，
+    # 导致 RE1-TT 也被命中、凭空删掉了宿主机 node-* 指标，已改回官方原样）。
+    # RE1-TT 不满足该条件 ⇒ 不触发 ⇒ 保留全部列。
+    if "mm-tt" in data_path or "torai-TT" in data_path:
+        time_col = df["time"]
+        df = df[[c for c in df.columns if c.startswith("ts-")]]
+        df["time"] = time_col
 
     # === Step 2: 识别格式 → 丢弃低分位延迟列 ===
     # OB: 丢弃 _latency-50; SS: 丢弃 lat_50, lat_99
@@ -366,7 +380,68 @@ def save_case_result(
         "pagerank_score": [score for _, score in result["ranks_scored"]]
     })
     df.to_csv(csv_path, index=False)
+
+    # === 额外保存因果图，供后续"固定图、换排序策略"的诊断使用 ===
+    # 注意: CSV 中的 node 列是"按 PageRank 得分排序"的，
+    #       与邻接矩阵的行/列下标顺序不一致，因此必须同时保存 node_names
+    #       （node_names[i] 对应 adj 的第 i 行/列）。
+    try:
+        np.save(join(case_dir, f"{case_id}_adj.npy"), result["adj"])
+        with open(join(case_dir, f"{case_id}_nodes.json"), "w", encoding="utf-8") as jf:
+            json.dump(result["node_names"], jf, ensure_ascii=False)
+    except Exception as e:
+        print(f"[WARN] 保存邻接矩阵失败 {case_dir}/{case_id}: {e}")
+
     return csv_path
+
+
+def load_ranks_from_case_csv(output_dir, ds_name, service, fault_type, case_id):
+    """
+    resume 用：从已保存的案例 CSV 读回排名列表。
+
+    输出文件: output_dir/{dataset}/{service}_{fault_type}/{case_id}.csv
+    文件不存在或读取失败时返回 None（表示该案例需要重新计算）。
+    """
+    case_csv = join(output_dir, ds_name, f"{service}_{fault_type}", f"{case_id}.csv")
+    if not os.path.exists(case_csv):
+        return None
+    try:
+        df = pd.read_csv(case_csv)
+        if "node" not in df.columns:
+            return None
+        ranks = df["node"].astype(str).tolist()
+        return ranks if ranks else None
+    except Exception:
+        return None
+
+
+def build_resumed_record(ds_name, service, fault_type, case_id, ranks,
+                         n_nodes="", n_edges=""):
+    """用读回的 ranks 构造 all_results 记录（真值排名按主流程口径重算）。"""
+    try:
+        rank_of_truth = next(
+            i + 1 for i, n in enumerate(ranks) if n.split("_")[0] == service
+        )
+    except StopIteration:
+        rank_of_truth = "not_found"
+
+    truth_metric = f"{service}_{FAULT_TO_METRIC.get(fault_type, fault_type)}"
+    try:
+        rank_of_truth_metric = ranks.index(truth_metric) + 1
+    except ValueError:
+        rank_of_truth_metric = "not_found"
+
+    return {
+        "dataset":     ds_name,
+        "service":     service,
+        "fault_type":  fault_type,
+        "case_id":     case_id,
+        "n_nodes":     n_nodes if n_nodes != "" else len(ranks),
+        "n_edges":     n_edges,
+        "ranks":       ranks,
+        "rank_of_truth":        rank_of_truth,
+        "rank_of_truth_metric": rank_of_truth_metric,
+    }
 
 
 def save_summary(all_results: list, output_dir: str):
@@ -377,6 +452,14 @@ def save_summary(all_results: list, output_dir: str):
     """
     rows = []
     for r in all_results:
+        # n_nodes / n_edges 可能是空字符串（resume 读回的旧记录），需容错
+        try:
+            density = round(
+                float(r["n_edges"]) / max(float(r["n_nodes"]) * (float(r["n_nodes"]) - 1), 1), 4
+            )
+        except (TypeError, ValueError):
+            density = ""
+
         rows.append({
             "dataset":    r["dataset"],
             "service":    r["service"],
@@ -384,9 +467,7 @@ def save_summary(all_results: list, output_dir: str):
             "case_id":    r["case_id"],
             "n_nodes":    r["n_nodes"],
             "n_edges":    r["n_edges"],
-            "edge_density": round(
-                r["n_edges"] / max(r["n_nodes"] * (r["n_nodes"] - 1), 1), 4
-            ),
+            "edge_density": density,
             "top1":       r["ranks"][0] if r["ranks"] else "",
             "top3":       "|".join(r["ranks"][:3]) if len(r["ranks"]) >= 3 else "",
             "ground_truth_service": r["service"],
@@ -434,6 +515,10 @@ def compute_and_print_eval(all_results: list, output_dir: str = None):
         ranks = r["ranks"]
         service = r["service"]
         fault_type = r["fault_type"]
+
+        if not ranks:
+            # 理论上不会出现（resume 已保证 ranks 非空）；容错跳过，避免 IndexError
+            continue
 
         # —— Service-level：只比较服务名 ——
         s_ranks = [Node(x.split("_")[0].replace("-db", ""), "unknown") for x in ranks]
@@ -571,36 +656,61 @@ def main():
         all_data_paths = all_data_paths[:2]
         print(f"[TEST] 仅处理前 {len(all_data_paths)} 个案例")
 
+    # === 分片（--shard I/N）：按 index % N 轮转切分，避免按 svc_fault 连续切导致
+    #     某些分片全是慢案例。各分片处理互不相交的案例子集，需配合独立 --output 目录。===
+    if args.shard:
+        try:
+            shard_i, shard_n = (int(x) for x in args.shard.split("/"))
+            assert 1 <= shard_i <= shard_n
+        except (ValueError, AssertionError):
+            print(f"[ERROR] --shard 格式应为 I/N 且 1 <= I <= N，收到: {args.shard}")
+            sys.exit(1)
+
+        total_before = len(all_data_paths)
+        all_data_paths = [
+            p for idx, p in enumerate(all_data_paths) if idx % shard_n == shard_i - 1
+        ]
+        print(f"[SHARD] {shard_i}/{shard_n}: {total_before} → {len(all_data_paths)} 个案例")
+
     print(f"\n共发现 {len(all_data_paths)} 个案例\n")
 
     # === Resume: 加载已完成的案例 ===
     all_results = []
     existing_cases = set()  # (dataset, service, fault_type, case_id)
     if args.resume:
-        # 1. 优先从 summary.csv 加载（最快）
+        # 1. 从 summary.csv 读元数据（n_edges 等），ranks 则从案例 CSV 读回
+        #    （summary.csv 里没有 ranks 字段，之前用占位空列表会导致 eval 崩溃）
         summary_path = join(args.output, "summary.csv")
         if os.path.exists(summary_path):
             existing_df = pd.read_csv(summary_path)
+            missing_csv = 0
             for _, row in existing_df.iterrows():
-                existing_cases.add((
-                    row["dataset"], row["service"], row["fault_type"], int(row["case_id"])
-                ))
-                # summary.csv 中无 ranks 字段，构造占位记录（ranks=[] 不影响后续处理）
-                all_results.append({
-                    "dataset":     row["dataset"],
-                    "service":     row["service"],
-                    "fault_type":  row["fault_type"],
-                    "case_id":     int(row["case_id"]),
-                    "n_nodes":     row.get("n_nodes", ""),
-                    "n_edges":     row.get("n_edges", ""),
-                    "ranks":       [],
-                    "rank_of_truth":       row.get("rank_of_truth", ""),
-                    "rank_of_truth_metric": row.get("rank_of_truth_metric", ""),
-                })
-            print(f"[RESUME] 从 summary.csv 加载了 {len(existing_cases)} 个已完成案例")
+                ds_r = row["dataset"]
+                service_r = row["service"]
+                fault_r = row["fault_type"]
+                case_r = int(row["case_id"])
 
-        # 2. 同时扫描案例 CSV 目录（summary.csv 不存在时的兜底）
-        # 只记录到 existing_cases 跳过列表，不污染 all_results（避免影响 eval）
+                ranks_r = load_ranks_from_case_csv(
+                    args.output, ds_r, service_r, fault_r, case_r
+                )
+                if ranks_r is None:
+                    # 案例 CSV 缺失 → 视为未完成，交给本次重跑
+                    missing_csv += 1
+                    continue
+
+                existing_cases.add((ds_r, service_r, fault_r, case_r))
+                all_results.append(build_resumed_record(
+                    ds_r, service_r, fault_r, case_r, ranks_r,
+                    n_nodes=row.get("n_nodes", ""),
+                    n_edges=row.get("n_edges", ""),
+                ))
+
+            print(f"[RESUME] 从 summary.csv + 案例 CSV 加载了 "
+                  f"{len(existing_cases)} 个已完成案例（ranks 已读回）")
+            if missing_csv:
+                print(f"[RESUME] 有 {missing_csv} 条 summary 记录缺少案例 CSV，将重新计算")
+
+        # 2. 扫描案例 CSV 目录，补齐 summary.csv 里没有的案例（含 ranks）
         csv_only_count = 0
         for ds_name in set(ds_name for _, ds_name in all_data_paths):
             ds_dir = join(args.output, ds_name)
@@ -614,18 +724,30 @@ def main():
                     continue
                 service, fault_type = svc_fault.split("_", 1)
                 for fn in os.listdir(svc_dir):
-                    if fn.endswith(".csv"):
-                        try:
-                            case_id = int(fn[:-4])
-                        except ValueError:
-                            continue
-                        key = (ds_name, service, fault_type, case_id)
-                        if key not in existing_cases:
-                            existing_cases.add(key)
-                            csv_only_count += 1
+                    if not fn.endswith(".csv"):
+                        continue
+                    try:
+                        case_id = int(fn[:-4])
+                    except ValueError:
+                        continue
+                    key = (ds_name, service, fault_type, case_id)
+                    if key in existing_cases:
+                        continue
+
+                    ranks_r = load_ranks_from_case_csv(
+                        args.output, ds_name, service, fault_type, case_id
+                    )
+                    if ranks_r is None:
+                        continue
+
+                    existing_cases.add(key)
+                    all_results.append(build_resumed_record(
+                        ds_name, service, fault_type, case_id, ranks_r,
+                    ))
+                    csv_only_count += 1
 
         if csv_only_count > 0:
-            print(f"[RESUME] 额外从案例 CSV 目录发现 {csv_only_count} 个已完成案例")
+            print(f"[RESUME] 额外从案例 CSV 目录补齐 {csv_only_count} 个案例（含 ranks）")
 
         if existing_cases:
             print(f"[RESUME] 共识别 {len(existing_cases)} 个已完成案例（将被跳过）")
@@ -706,8 +828,9 @@ def main():
                 continue
 
     except KeyboardInterrupt:
+        ds_hint = args.dataset if args.dataset else "re1-ob"
         print(f"\n\n[INTERRUPTED] Ctrl+C 中断! 已保存 {len(all_results)} 个案例结果")
-        print(f"下次运行: python run_granger.py --dataset re1-ss --output {args.output} --resume")
+        print(f"下次运行: python run_granger.py --dataset {ds_hint} --output {args.output} --resume")
 
     finally:
         # 无论正常结束还是 Ctrl+C 中断，都保存当前进度

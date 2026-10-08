@@ -86,7 +86,7 @@ DATASETS = {
     },
 }
 
-OUTPUT_ROOT = join(ROOT, "output", "pcmci_latency_fix")
+_DEFAULT_OUTPUT_ROOT = join(ROOT, "output", "pcmci_latency_fix")
 
 TAU_MAX = 3
 # 【2026-09-25 统一口径】官方 PCMCI 默认 alpha = 0.20 (见 graph_construction/pcmci.py)
@@ -257,7 +257,8 @@ def process_case(task):
     ds_name, data_path, old_output, out_dir, make_graph = task
     t_start = time.time()
     try:
-        data, inject_time, service, fault_type, case_id = load_case(data_path)
+        data, inject_time, service, fault_type, case_id = load_case(
+            data_path, window_length_min=WINDOW_LENGTH_MIN)
 
         old_names_path = join(old_output, f"{service}_{fault_type}", f"{case_id}_node_names.json")
         with open(old_names_path, "r", encoding="utf-8") as f:
@@ -359,7 +360,19 @@ def parse_args():
     p = argparse.ArgumentParser(description="PCMCI + latency 特征重跑（方法二）")
     p.add_argument("--datasets", type=str, default=",".join(DATASETS.keys()),
                    help="逗号分隔的数据集名，默认 RE1-TT,RE1-SS")
+    # 【2026-10-06 新增】供 Layer 2 降采样等"同一数据集的不同变体"使用：
+    #   只要传了 --data-root，就可以复用同一份 DATASETS 配置，无需改代码或硬编码路径。
+    p.add_argument("--data-root", type=str, default=None,
+                   help="覆盖数据根目录（其下递归查找 data.csv）")
+    p.add_argument("--old-output", type=str, default=None,
+                   help="覆盖旧基线输出目录（需含 {case}_node_names.json）")
+    p.add_argument("--output", type=str, default=None,
+                   help="覆盖输出根目录")
     p.add_argument("--workers", type=int, default=N_WORKERS, help="并行进程数")
+    # 【2026-10-07 新增】窗口长度（分钟）。降采样实验必须同步缩小：
+    #   k=2 → --window 10，k=4 → --window 5（保证每段物理时长恒为 10 分钟）
+    p.add_argument("--window", type=int, default=WINDOW_LENGTH_MIN,
+                   help=f"窗口长度（分钟），默认 {WINDOW_LENGTH_MIN}")
     p.add_argument("--tau_max", type=int, default=TAU_MAX)
     p.add_argument("--alpha", type=float, default=ALPHA)
     p.add_argument("--test", action="store_true", help="冒烟测试：每数据集只跑 1 个案例")
@@ -370,18 +383,21 @@ def parse_args():
 
 
 def main():
-    global TAU_MAX, ALPHA
+    global TAU_MAX, ALPHA, WINDOW_LENGTH_MIN
     args = parse_args()
     TAU_MAX = args.tau_max
     ALPHA = args.alpha
+    WINDOW_LENGTH_MIN = args.window
 
     ds_names = [d.strip() for d in args.datasets.split(",") if d.strip()]
-    for d in ds_names:
-        if d not in DATASETS:
-            print(f"错误：未知数据集 {d}（可选: {list(DATASETS)}）")
-            sys.exit(1)
+    if not args.data_root:                      # 传了 --data-root 就允许任意数据集名
+        for d in ds_names:
+            if d not in DATASETS:
+                print(f"错误：未知数据集 {d}（可选: {list(DATASETS)}；或传 --data-root 直接指定路径）")
+                sys.exit(1)
 
-    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    out_root = args.output or _DEFAULT_OUTPUT_ROOT
+    os.makedirs(out_root, exist_ok=True)
 
     print("=" * 72)
     print("PCMCI + latency 特征重跑（方法二 · 白名单修正版 · RE1-OB 全 125 案例）")
@@ -390,7 +406,7 @@ def main():
     print(f"  tau_max:     {TAU_MAX}   alpha: {ALPHA}")
     print(f"  窗口长度:    {WINDOW_LENGTH_MIN} min")
     print(f"  并行度:      {args.workers}")
-    print(f"  输出目录:    {OUTPUT_ROOT}")
+    print(f"  输出目录:    {out_root}")
     print("=" * 72)
 
     grand_start = time.time()
@@ -398,8 +414,12 @@ def main():
     all_old = []
 
     for ds_name in ds_names:
-        cfg = DATASETS[ds_name]
-        data_root, old_output = cfg["data_root"], cfg["old_output"]
+        cfg = DATASETS.get(ds_name, {})
+        data_root = args.data_root or cfg.get("data_root")
+        old_output = args.old_output or cfg.get("old_output")
+        if not data_root:
+            print(f"\n[ERROR] {ds_name}: 既未在 DATASETS 里配置，也未传 --data-root，跳过")
+            continue
 
         data_paths = sorted(glob.glob(join(data_root, "**", "data.csv"), recursive=True))
         data_paths = [p for p in data_paths
@@ -413,7 +433,7 @@ def main():
         elif args.limit:
             data_paths = data_paths[:args.limit]
 
-        out_dir = OUTPUT_ROOT
+        out_dir = out_root
         pending = []
         for dp in data_paths:
             svc_fault = basename(dirname(dirname(dp)))
@@ -454,7 +474,7 @@ def main():
                 "case_id": int(cid), "n_nodes": len(ranks), "variant": "new_add_latency", **m,
             })
         ds_new = pd.DataFrame(rows)
-        ds_new.to_csv(join(OUTPUT_ROOT, f"summary_latency_fix_{ds_name}.csv"), index=False)
+        ds_new.to_csv(join(out_root, f"summary_latency_fix_{ds_name}.csv"), index=False)
 
         ds_old = compute_old_baseline(ds_name, old_output)
         all_old.append(ds_old)
@@ -480,14 +500,14 @@ def main():
         print(f"{'Avg n_nodes':<14}{ds_old['n_nodes'].mean():>12.1f}{ds_new['n_nodes'].mean():>14.1f}"
               f"{ds_new['n_nodes'].mean()-ds_old['n_nodes'].mean():>+10.1f}")
 
-        pd.DataFrame(cmp_rows).to_csv(join(OUTPUT_ROOT, f"compare_{ds_name}.csv"), index=False)
+        pd.DataFrame(cmp_rows).to_csv(join(out_root, f"compare_{ds_name}.csv"), index=False)
 
         per_svc = ds_new.groupby("service").agg(
             n=("case_id", "count"),
             Svc_AC1=("Svc-AC@1", "mean"), Svc_AC3=("Svc-AC@3", "mean"), Svc_AC5=("Svc-AC@5", "mean"),
             Mtr_AC1=("Mtr-AC@1", "mean"), Mtr_AC3=("Mtr-AC@3", "mean"), Mtr_AC5=("Mtr-AC@5", "mean"),
         ).round(3).reset_index()
-        per_svc.to_csv(join(OUTPUT_ROOT, f"per_service_{ds_name}.csv"), index=False)
+        per_svc.to_csv(join(out_root, f"per_service_{ds_name}.csv"), index=False)
 
     total_elapsed = time.time() - grand_start
 
@@ -506,12 +526,12 @@ def main():
 
     all_rows = []
     for ds_name in ds_names:
-        f = join(OUTPUT_ROOT, f"summary_latency_fix_{ds_name}.csv")
+        f = join(out_root, f"summary_latency_fix_{ds_name}.csv")
         if os.path.exists(f):
             all_rows.append(pd.read_csv(f))
     if all_rows:
         full = pd.concat(all_rows, ignore_index=True)
-        full.to_csv(join(OUTPUT_ROOT, "summary_latency_fix_ALL.csv"), index=False)
+        full.to_csv(join(out_root, "summary_latency_fix_ALL.csv"), index=False)
 
         # 自适应表头：每个数据集一列 + ALL
         col_w = 14
@@ -550,13 +570,13 @@ def main():
                        + f"{sub['Mtr_Rank'].mean():>{col_w}.2f}")
                 print(row)
 
-    cmp_files = [join(OUTPUT_ROOT, f"compare_{d}.csv") for d in ds_names]
+    cmp_files = [join(out_root, f"compare_{d}.csv") for d in ds_names]
     cmp_files = [f for f in cmp_files if os.path.exists(f)]
     if cmp_files:
         pd.concat([pd.read_csv(f) for f in cmp_files], ignore_index=True).to_csv(
-            join(OUTPUT_ROOT, "compare_ALL.csv"), index=False)
+            join(out_root, "compare_ALL.csv"), index=False)
 
-    print(f"\n输出目录: {OUTPUT_ROOT}")
+    print(f"\n输出目录: {out_root}")
     print("完成。")
 
 
